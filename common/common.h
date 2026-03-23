@@ -227,6 +227,7 @@ struct gpt_params {
     int32_t max_gpu               =       0; // max number of GPUs to use at a time for split mode "graph"
     int32_t ncmoe                 =       0; // number of layers in which MoE tensors are left in VRAM
     std::string hot_expert_profile = "";     // path to hot-expert profile JSON for selective expert loading
+    int32_t hot_expert_percent    =       0; // randomly load N% of experts per layer (0 = disabled, 1-100)
     float   tensor_split[128]     =     {0}; // how split tensors should be distributed across GPUs
     int32_t grp_attn_n            =       1; // group-attention factor
     int32_t grp_attn_w            =     512; // group-attention width

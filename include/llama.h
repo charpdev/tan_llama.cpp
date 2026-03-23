@@ -477,6 +477,7 @@ extern "C" {
         void *              offload_policy;
         void *              cuda_params;
         const char *        hot_expert_profile; // path to hot-expert profile for selective GPU loading (nullptr = disabled)
+        int32_t             hot_expert_percent; // randomly load N% of experts per layer (0 = disabled, 1-100)
     };
 
     // model quantization parameters
