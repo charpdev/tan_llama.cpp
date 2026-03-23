@@ -55,6 +55,11 @@
 #  include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_CUDA
+static void llama_clear_expert_ptr_tables();
+extern "C" void ** llama_get_expert_d_ptrs(const ggml_tensor * tensor);
+#endif
+
 #ifdef __has_include
     #if __has_include(<unistd.h>)
         #include <unistd.h>
@@ -652,6 +657,9 @@ void llama_context::set_mtp_op_type(llama_mtp_op_type value) {
 }
 
 llama_context::~llama_context() {
+#ifdef GGML_USE_CUDA
+    llama_clear_expert_ptr_tables();
+#endif
     ggml_backend_sched_free(sched);
 
     for (ggml_backend_t backend : backends) {
@@ -4644,6 +4652,7 @@ struct llama_context_params llama_context_default_params() {
         /*.abort_callback_data         =*/ nullptr,
         /*.offload_policy              =*/ nullptr,
         /*.cuda_params                 =*/ nullptr,
+        /*.hot_expert_profile          =*/ nullptr,
     };
 
     return result;
@@ -4934,6 +4943,155 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Selective expert loading: copy hot expert slices to GPU, leave cold on CPU.
+// Activated by gpt_params::hot_expert_profile (--hot-expert-profile flag).
+//
+// For each MoE layer, reads the hot expert set from the profile file and
+// cudaMemcpy's those slices into a contiguous GPU buffer. The dispatch table
+// (expert_index → GPU pointer or nullptr) is stored per tensor instance and
+// consumed by the CUDA kernels in ggml-cuda.cu.
+// ---------------------------------------------------------------------------
+
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+
+// Dispatch table: tensor pointer → device pointer array (null = CPU).
+// Populated by llama_selective_expert_load(), read by ggml-cuda.cu.
+struct ExpertPtrTable {
+    std::vector<void *> ptrs;    // GPU pointer per expert, nullptr = CPU
+    void ** d_ptrs    = nullptr; // device-side copy of ptrs[] for kernel access
+    int     n_experts = 0;
+};
+static std::unordered_map<const ggml_tensor *, ExpertPtrTable> g_expert_ptr_tables;
+static std::unordered_map<const ggml_tensor *, void **>         g_expert_d_ptr_cache;
+static std::mutex                                       g_expert_ptr_tables_mu;
+
+// C-linkage accessor for ggml-cuda.cu: returns device-side pointer array or nullptr
+static void llama_clear_expert_ptr_tables() {
+    std::lock_guard<std::mutex> lk(g_expert_ptr_tables_mu);
+    for (auto & kv : g_expert_ptr_tables) {
+        auto & table = kv.second;
+        for (void * ptr : table.ptrs) {
+            if (ptr != nullptr) {
+                cudaFree(ptr);
+            }
+        }
+        if (table.d_ptrs != nullptr) {
+            cudaFree(table.d_ptrs);
+            table.d_ptrs = nullptr;
+        }
+        table.ptrs.clear();
+        table.n_experts = 0;
+    }
+    g_expert_ptr_tables.clear();
+    g_expert_d_ptr_cache.clear();
+}
+
+extern "C" void ** llama_get_expert_d_ptrs(const ggml_tensor * tensor) {
+    auto it = g_expert_d_ptr_cache.find(tensor);
+    return (it != g_expert_d_ptr_cache.end()) ? it->second : nullptr;
+}
+#endif // GGML_USE_CUDA
+
+static void llama_selective_expert_load(llama_context & lctx, const std::string & profile_path) {
+#ifndef GGML_USE_CUDA
+    LLAMA_LOG_WARN("%s: CUDA not available, --hot-expert-profile ignored\n", __func__);
+    (void)lctx; (void)profile_path;
+#else
+    llama_clear_expert_ptr_tables();
+
+    // Parse profile: lines of "<layer> <id0> <id1> ..."
+    std::unordered_map<int, std::vector<int>> hot_sets; // layer → hot expert ids
+    {
+        std::ifstream f(profile_path);
+        if (!f) {
+            LLAMA_LOG_ERROR("%s: cannot open hot-expert profile: %s\n", __func__, profile_path.c_str());
+            return;
+        }
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            int layer; ss >> layer;
+            int id;
+            while (ss >> id) hot_sets[layer].push_back(id);
+        }
+    }
+    if (hot_sets.empty()) {
+        LLAMA_LOG_WARN("%s: hot-expert profile is empty: %s\n", __func__, profile_path.c_str());
+        return;
+    }
+
+    auto & model = lctx.model;
+    size_t total_gpu_bytes = 0;
+    int    total_hot       = 0;
+
+    for (int il = 0; il < (int)model.layers.size(); ++il) {
+        auto & l = model.layers[il];
+        auto it = hot_sets.find(il);
+        if (it == hot_sets.end()) continue;
+        const auto & hot_ids = it->second;
+
+        // Process gate_exps, up_exps, down_exps (and fused up_gate_exps if present)
+        std::vector<ggml_tensor *> tensors;
+        if (l.ffn_gate_exps)     tensors.push_back(l.ffn_gate_exps);
+        if (l.ffn_up_exps)       tensors.push_back(l.ffn_up_exps);
+        if (l.ffn_down_exps)     tensors.push_back(l.ffn_down_exps);
+        if (l.ffn_up_gate_exps)  tensors.push_back(l.ffn_up_gate_exps);
+
+        for (ggml_tensor * t : tensors) {
+            if (!t) continue;
+            // Only process CPU-resident tensors (skip if already on GPU)
+            if (!ggml_backend_buffer_is_host(t->buffer)) continue;
+
+            const size_t expert_stride = t->nb[2];
+            const int    n_experts     = (int)t->ne[2];
+
+            // Read full tensor into host buffer
+            const size_t total_bytes = ggml_nbytes(t);
+            std::vector<char> host_buf(total_bytes);
+            ggml_backend_tensor_get(t, host_buf.data(), 0, total_bytes);
+
+            // Build dispatch table
+            std::lock_guard<std::mutex> lk(g_expert_ptr_tables_mu);
+            auto & table = g_expert_ptr_tables[t];
+            if ((int) table.ptrs.size() != n_experts) {
+                table.ptrs.assign(n_experts, nullptr);
+            }
+            table.n_experts = n_experts;
+
+            for (int eid : hot_ids) {
+                if (eid < 0 || eid >= n_experts) continue;
+                if (table.ptrs[eid]) continue; // already allocated
+
+                void * gpu_ptr = nullptr;
+                cudaError_t err = cudaMalloc(&gpu_ptr, expert_stride);
+                if (err != cudaSuccess) {
+                    LLAMA_LOG_ERROR("%s: cudaMalloc failed for layer %d expert %d tensor %s: %s\n",
+                        __func__, il, eid, t->name, cudaGetErrorString(err));
+                    continue;
+                }
+                const char * src = host_buf.data() + (size_t)eid * expert_stride;
+                cudaMemcpy(gpu_ptr, src, expert_stride, cudaMemcpyHostToDevice);
+                table.ptrs[eid] = gpu_ptr;
+                total_gpu_bytes += expert_stride;
+                total_hot++;
+            }
+            // Upload pointer table to device so kernels can use it
+            if (!table.d_ptrs) {
+                cudaMalloc(&table.d_ptrs, n_experts * sizeof(void *));
+            }
+            cudaMemcpy(table.d_ptrs, table.ptrs.data(), n_experts * sizeof(void *), cudaMemcpyHostToDevice);
+            g_expert_d_ptr_cache[t] = table.d_ptrs;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: loaded %d hot expert slices to GPU (%.1f MiB)\n",
+        __func__, total_hot, total_gpu_bytes / 1024.0 / 1024.0);
+#endif // GGML_USE_CUDA
 }
 
 struct llama_context * llama_init_from_model(
@@ -5409,7 +5567,16 @@ struct llama_context * llama_init_from_model(
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
             }
 
+            if (params.hot_expert_profile) {
+                ggml_backend_sched_set_hot_expert_profile(ctx->sched, params.hot_expert_profile);
+            }
+
             llama_repack_up_gate_exps(*ctx);
+
+            // selective expert loading: copy hot expert slices to GPU
+            if (params.hot_expert_profile) {
+                llama_selective_expert_load(*ctx, params.hot_expert_profile);
+            }
 
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
@@ -5431,6 +5598,10 @@ struct llama_context * llama_init_from_model(
                     return nullptr;
                 }
             }
+
+            // Reserve/warmup can populate expert residency bookkeeping before the
+            // first real request. Start serving from a clean selective-loading state.
+            ggml_backend_sched_clear_expert_state(ctx->sched);
 
             for (size_t i = 0; i < ctx->backends.size(); i++) {
                 ggml_backend_t backend = ctx->backends[i];
@@ -8762,4 +8933,3 @@ void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_of
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {
     ctx->draft_input_hidden_state = hidden_state;
 }
-

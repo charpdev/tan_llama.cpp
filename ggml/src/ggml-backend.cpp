@@ -4,15 +4,19 @@
 #include "ggml-rpc.h"
 
 #include <cassert>
+#include <cctype>
 #include <climits>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <set>
 #include <array>
+#include <unordered_map>
 #include <chrono>
 #include <barrier>
 #include <thread>
@@ -1124,6 +1128,23 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_expert_cache_key {
+    const ggml_tensor * src;
+    const ggml_tensor * dst;
+
+    bool operator==(const ggml_expert_cache_key & other) const {
+        return src == other.src && dst == other.dst;
+    }
+};
+
+struct ggml_expert_cache_key_hash {
+    size_t operator()(const ggml_expert_cache_key & key) const {
+        const auto h1 = std::hash<const ggml_tensor *>{}(key.src);
+        const auto h2 = std::hash<const ggml_tensor *>{}(key.dst);
+        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1179,13 +1200,177 @@ struct ggml_backend_sched {
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
+    std::unordered_map<ggml_expert_cache_key, std::vector<uint32_t>, ggml_expert_cache_key_hash> expert_resident_masks;
+    std::unordered_map<ggml_expert_cache_key, std::vector<uint32_t>, ggml_expert_cache_key_hash> expert_hot_resident_masks;
+    std::unordered_map<int, std::vector<int32_t>> expert_hot_ids_by_layer;
 
     bool only_active_experts;
+    bool enable_expert_cache = true;
+    bool enable_hot_expert_profile = false;
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
+    bool debug_expert_cache = false;
+    bool debug_sync_host_expert_staging = false;
     bool has_reduce = false;
 };
+
+static inline int ggml_parse_tensor_layer_id(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return -1;
+    }
+    const char * pos = strstr(tensor->name, "blk.");
+    if (pos) {
+        pos += 4;
+        char * end = nullptr;
+        long layer = strtol(pos, &end, 10);
+        if (end != pos && end != nullptr && *end == '.') {
+            return (int) layer;
+        }
+    }
+
+    const char * dash = strrchr(tensor->name, '-');
+    if (!dash || !isdigit((unsigned char) dash[1])) {
+        return -1;
+    }
+    char * end = nullptr;
+    long layer = strtol(dash + 1, &end, 10);
+    if (end == dash + 1 || end == nullptr || *end != '\0') {
+        return -1;
+    }
+    return (int) layer;
+}
+
+static inline bool ggml_is_runtime_moe_down_tensor(const struct ggml_tensor * tensor) {
+    return tensor != nullptr && strncmp(tensor->name, "ffn_moe_down-", 13) == 0;
+}
+
+static inline bool ggml_is_host_expert_weight_tensor_for_staging(ggml_backend_sched_t sched, const struct ggml_tensor * tensor) {
+    if (sched == nullptr || tensor == nullptr || tensor->buffer == nullptr) {
+        return false;
+    }
+
+    if (!sched->only_active_experts) {
+        return false;
+    }
+
+    return ggml_backend_buffer_is_host(tensor->buffer) &&
+           ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           tensor->ne[2] > 1;
+}
+
+static inline void * ggml_tensor_effective_base(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    return ggml_backend_buffer_get_base(buf);
+}
+
+static inline void ggml_trim_inplace(std::string & s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
+    }
+    size_t start = 0;
+    while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) {
+        ++start;
+    }
+    if (start > 0) {
+        s.erase(0, start);
+    }
+}
+
+static bool ggml_backend_sched_zero_expert_dst_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_ZERO_EXPERT_DST");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool ggml_backend_sched_copy_full_expert_tensor_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_COPY_FULL_EXPERT_TENSOR");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+static bool ggml_backend_sched_copy_expert_span_enabled() {
+    static const bool enabled = []() {
+        const char * v = getenv("GGML_COPY_EXPERT_SPAN");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
+static void ggml_backend_sched_load_hot_profile(ggml_backend_sched_t sched, const char * path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        fprintf(stderr, "%s: failed to open hot profile %s\n", __func__, path);
+        return;
+    }
+
+    int current_layer = -1;
+    std::string line;
+    while (std::getline(in, line)) {
+        ggml_trim_inplace(line);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        {
+            std::istringstream ss(line);
+            int layer = -1;
+            if ((ss >> layer) && layer >= 0) {
+                auto & layer_ids = sched->expert_hot_ids_by_layer[layer];
+                int expert_id = -1;
+                bool any_ids = false;
+                while (ss >> expert_id) {
+                    layer_ids.push_back((int32_t) expert_id);
+                    any_ids = true;
+                }
+                if (any_ids) {
+                    current_layer = layer;
+                    continue;
+                }
+                sched->expert_hot_ids_by_layer.erase(layer);
+            }
+        }
+        if (line.size() >= 4 && line[0] == '"' && isdigit(line[1])) {
+            char * end = nullptr;
+            long parsed = strtol(line.c_str() + 1, &end, 10);
+            if (end != line.c_str() + 1 && end != nullptr && *end == '"') {
+                current_layer = (int) parsed;
+                sched->expert_hot_ids_by_layer.try_emplace(current_layer);
+            }
+            continue;
+        }
+        if (current_layer >= 0) {
+            const char * key = "\"expert_id\":";
+            const char * found = strstr(line.c_str(), key);
+            if (found != nullptr) {
+                char * end = nullptr;
+                long expert_id = strtol(found + strlen(key), &end, 10);
+                if (end != found + (int) strlen(key)) {
+                    sched->expert_hot_ids_by_layer[current_layer].push_back((int32_t) expert_id);
+                }
+            }
+        }
+    }
+
+    if (!sched->expert_hot_ids_by_layer.empty()) {
+        sched->enable_hot_expert_profile = true;
+        fprintf(stderr, "%s: loaded hot expert profile %s with %zu layers\n",
+                __func__, path, sched->expert_hot_ids_by_layer.size());
+    }
+}
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
     int int_op = (int)op;
@@ -1207,6 +1392,21 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_hot_expert_profile(ggml_backend_sched_t sched, const char * path) {
+    if (!sched) return;
+    sched->expert_hot_ids_by_layer.clear();
+    sched->expert_hot_resident_masks.clear();
+    sched->expert_resident_masks.clear();
+    sched->enable_hot_expert_profile = false;
+    ggml_backend_sched_load_hot_profile(sched, path);
+}
+
+void ggml_backend_sched_clear_expert_state(ggml_backend_sched_t sched) {
+    if (!sched) return;
+    sched->expert_hot_resident_masks.clear();
+    sched->expert_resident_masks.clear();
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -1967,7 +2167,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 }
 
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
-        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
+        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor *& last_ids_tensor) {
     if (split->n_inputs < 1) return;
     constexpr bool k_set_sync = false;
     int split_backend_id = split->backend_id;
@@ -1978,6 +2178,19 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+        const bool is_runtime_moe_down = ggml_is_runtime_moe_down_tensor(input);
+        const int parsed_input_layer = ggml_parse_tensor_layer_id(input);
+        const bool interesting_debug = !is_runtime_moe_down || parsed_input_layer >= 36;
+
+        if (sched->debug_expert_cache && interesting_debug && (is_runtime_moe_down || (input->flags & GGML_TENSOR_FLAG_INPUT))) {
+            fprintf(stderr, "%s: split backend=%s input=%s ne=[%lld,%lld,%lld,%lld] host=%d usage=%d flags=%d\n",
+                    __func__, ggml_backend_name(split_backend), input->name,
+                    (long long) input->ne[0], (long long) input->ne[1],
+                    (long long) input->ne[2], (long long) input->ne[3],
+                    (int) ggml_backend_buffer_is_host(input->buffer),
+                    (int) ggml_backend_buffer_get_usage(input->buffer),
+                    (int) input->flags);
+        }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2003,9 +2216,17 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             }
 
             ggml_tensor * node = split->graph.nodes[0];
-            if (sched->only_active_experts && split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            const bool allow_host_expert_tensor =
                     ggml_backend_buffer_is_host(input->buffer) &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+
+            if (sched->debug_expert_cache && allow_host_expert_tensor && interesting_debug) {
+                fprintf(stderr, "%s: host expert input %s node_op=%d only_active=%d split_nodes=%d usage=%d\n",
+                        __func__, input->name, (int) node->op, (int) sched->only_active_experts,
+                        split->graph.n_nodes, (int) ggml_backend_buffer_get_usage(input->buffer));
+            }
+            if (sched->only_active_experts && split->graph.n_nodes > 0 &&
+                    allow_host_expert_tensor &&
                     (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE)) {
 
                 if (input_backend != last_input_backend) {
@@ -2013,7 +2234,20 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     last_input_backend = input_backend;
                 }
 
-                ggml_tensor * ids_tensor = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : node->src[3];
+                ggml_tensor * ids_tensor = nullptr;
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    ids_tensor = node->src[2];
+                } else if (node->op == GGML_OP_MOE_FUSED_UP_GATE) {
+                    ids_tensor = node->src[3];
+                }
+
+                if (ids_tensor == nullptr) {
+                    if (sched->debug_expert_cache && interesting_debug) {
+                        fprintf(stderr, "%s: skipping %s because ids tensor was not found for node_op=%d\n",
+                                __func__, input->name, (int) node->op);
+                    }
+                    continue;
+                }
                 auto ids_backend = split_backend;
 
                 // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
@@ -2026,9 +2260,10 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     }
                 }
 
-                int n_expert = node->src[0]->ne[2];
+                int n_expert = (int) node->src[0]->ne[2];
 
-                if (ids_tensor != last_ids_tensor) {
+                const bool ids_changed = ids_tensor != last_ids_tensor;
+                if (ids_changed) {
                     ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
 
                     ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
@@ -2045,18 +2280,189 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                         }
                     }
 
+                    // Active expert residency is transient and must be recomputed for every new routed-id tensor.
+                    // Hot residency lives in expert_hot_resident_masks and is preserved separately.
+                    sched->expert_resident_masks.clear();
                     last_ids_tensor = ids_tensor;
                 }
 
+                const int64_t ids_rows = ids_tensor->ne[0];
+                const int64_t ids_cols = ids_tensor->ne[1];
+                const bool is_decode_like = ids_cols <= 1;
+
+                const bool has_expert_axis = input->ne[2] > 1;
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
 
-                if (input->ne[2] > 1) {
+                if (has_expert_axis) {
+                    if (ggml_backend_sched_zero_expert_dst_enabled() && ids_changed) {
+                        std::vector<uint8_t> zero_buf(ggml_nbytes(input_cpy), 0);
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, zero_buf.data(), 0, zero_buf.size());
+                    }
+                    if (ggml_backend_sched_copy_full_expert_tensor_enabled()) {
+                        ggml_backend_tensor_copy(input, input_cpy);
+                        continue;
+                    }
+                    if (sched->debug_expert_cache && interesting_debug) {
+                        fprintf(stderr, "%s: saw expert tensor %s ne=[%lld,%lld,%lld,%lld] on backend %s\n",
+                                __func__, input->name,
+                                (long long) input->ne[0], (long long) input->ne[1],
+                                (long long) input->ne[2], (long long) input->ne[3],
+                                ggml_backend_name(split_backend));
+                    }
+                    if (sched->debug_expert_cache && parsed_input_layer == 0) {
+                        fprintf(stderr,
+                                "%s: ptrs tensor=%s src=%p dst=%p src_data=%p dst_data=%p src_base=%p dst_base=%p src_view=%p dst_view=%p\n",
+                                __func__,
+                                input->name,
+                                (void *) input,
+                                (void *) input_cpy,
+                                input->data,
+                                input_cpy ? input_cpy->data : nullptr,
+                                ggml_tensor_effective_base(input),
+                                ggml_tensor_effective_base(input_cpy),
+                                (void *) input->view_src,
+                                input_cpy ? (void *) input_cpy->view_src : nullptr);
+                    }
+                    const bool use_resident_mask = sched->enable_expert_cache || sched->enable_hot_expert_profile;
+                    std::vector<uint32_t> missing_ids(unique_ids.size(), 0);
+                    int n_selected = 0;
+                    int n_missing = 0;
+                    int hot_preloaded = 0;
+                    size_t hot_preload_bytes = 0;
+                    size_t cold_copy_bytes = 0;
+                    if (use_resident_mask) {
+                        ggml_expert_cache_key cache_key = { input, input_cpy };
+                        auto & hot_resident_mask = sched->expert_hot_resident_masks[cache_key];
+                        auto & resident_mask = sched->expert_resident_masks[cache_key];
+                        if (sched->debug_expert_cache && parsed_input_layer == 0) {
+                            fprintf(stderr,
+                                    "%s: cache key tensor=%s src=%p dst=%p hot_mask_words=%zu resident_words=%zu ids_changed=%d\n",
+                                    __func__,
+                                    input->name,
+                                    (void *) input,
+                                    (void *) input_cpy,
+                                    hot_resident_mask.size(),
+                                    resident_mask.size(),
+                                    (int) ids_changed);
+                        }
+                        if (hot_resident_mask.size() != unique_ids.size()) {
+                            hot_resident_mask.assign(unique_ids.size(), 0);
+                        }
+                        if (resident_mask.size() != unique_ids.size()) {
+                            resident_mask = hot_resident_mask;
+                        }
+
+                        if (sched->enable_hot_expert_profile) {
+                            int layer_id = ggml_parse_tensor_layer_id(input);
+                            auto hot_it = sched->expert_hot_ids_by_layer.find(layer_id);
+                            if (sched->debug_expert_cache && interesting_debug) {
+                                fprintf(stderr, "%s: expert tensor %s parsed layer=%d hot_match=%d n_expert=%d\n",
+                                        __func__, input->name, layer_id, hot_it != sched->expert_hot_ids_by_layer.end(), n_expert);
+                            }
+                            if (hot_it != sched->expert_hot_ids_by_layer.end()) {
+                                std::vector<uint32_t> hot_missing(unique_ids.size(), 0);
+                                if (sched->debug_expert_cache && interesting_debug) {
+                                    fprintf(stderr, "%s: considering hot profile for layer %d tensor %s with %zu configured experts\n",
+                                            __func__, layer_id, input->name, hot_it->second.size());
+                                }
+                                for (int32_t expert_id : hot_it->second) {
+                                    if (expert_id < 0 || expert_id >= n_expert) {
+                                        continue;
+                                    }
+                                    const size_t word = (size_t) expert_id >> 5;
+                                    const uint32_t bit = 1u << (expert_id & 31);
+                                    if ((hot_resident_mask[word] & bit) == 0) {
+                                        hot_missing[word] |= bit;
+                                        hot_resident_mask[word] |= bit;
+                                        hot_preloaded++;
+                                    }
+                                }
+
+                                if (hot_preloaded > 0) {
+                                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                                        const size_t expert_offset = first_id * expert_size;
+                                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                                        const size_t padding = 512;
+                                        const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+                                        hot_preload_bytes += expert_size_copy + padding_end;
+
+                                        ggml_backend_tensor_set_async(split_backend,
+                                                input_cpy,
+                                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                                expert_size_copy + padding_end);
+                                    };
+
+                                    auto next_on_id = [&hot_missing, n_expert] (int id) {
+                                        while (id < n_expert && (hot_missing[id >> 5] & (1u << (id & 31))) == 0) ++id;
+                                        return id;
+                                    };
+                                    auto next_off_id = [&hot_missing, n_expert] (int id) {
+                                        while (id < n_expert && (hot_missing[id >> 5] & (1u << (id & 31))) != 0) ++id;
+                                        return id;
+                                    };
+
+                                    int first_id = next_on_id(0);
+                                    while (first_id < n_expert) {
+                                        int last_id = next_off_id(first_id+1);
+                                        copy_experts(first_id, last_id-1);
+                                        first_id = next_on_id(last_id);
+                                    }
+
+                                    if (sched->debug_expert_cache && interesting_debug) {
+                                        fprintf(stderr, "%s: preloaded %d hot experts for layer %d tensor %s on %s\n",
+                                                __func__, hot_preloaded, layer_id, input->name, ggml_backend_name(split_backend));
+                                    }
+                                } else if (sched->debug_expert_cache && interesting_debug) {
+                                    fprintf(stderr, "%s: hot profile matched layer %d tensor %s but nothing new was preloaded\n",
+                                            __func__, layer_id, input->name);
+                                }
+                            }
+                        }
+
+                        if (ids_changed) {
+                            resident_mask = hot_resident_mask;
+                        }
+
+                        if (sched->debug_expert_cache && parsed_input_layer == 0) {
+                            int hot_count = 0;
+                            int resident_count = 0;
+                            for (size_t idx = 0; idx < hot_resident_mask.size(); ++idx) {
+                                hot_count += __builtin_popcount(hot_resident_mask[idx]);
+                            }
+                            for (size_t idx = 0; idx < resident_mask.size(); ++idx) {
+                                resident_count += __builtin_popcount(resident_mask[idx]);
+                            }
+                            fprintf(stderr,
+                                    "%s: cache state tensor=%s src=%p dst=%p hot_count=%d resident_count=%d selected_words=%zu\n",
+                                    __func__,
+                                    input->name,
+                                    (void *) input,
+                                    (void *) input_cpy,
+                                    hot_count,
+                                    resident_count,
+                                    unique_ids.size());
+                        }
+
+                        for (size_t idx = 0; idx < unique_ids.size(); ++idx) {
+                            missing_ids[idx] = unique_ids[idx] & ~resident_mask[idx];
+                            resident_mask[idx] |= unique_ids[idx];
+                            n_selected += __builtin_popcount(unique_ids[idx]);
+                            n_missing += __builtin_popcount(missing_ids[idx]);
+                        }
+                    } else {
+                        for (size_t idx = 0; idx < unique_ids.size(); ++idx) {
+                            missing_ids[idx] = unique_ids[idx];
+                            n_selected += __builtin_popcount(unique_ids[idx]);
+                            n_missing += __builtin_popcount(missing_ids[idx]);
+                        }
+                    }
 
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = 512;
                         const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+                        cold_copy_bytes += expert_size_copy + padding_end;
 
                         ggml_backend_tensor_set_async(split_backend,
                                 input_cpy,
@@ -2066,20 +2472,61 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 
                     };
 
-                    auto next_on_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
+                    auto next_on_id = [&missing_ids, n_expert] (int id) {
+                        while (id < n_expert && (missing_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
                         return id;
                     };
-                    auto next_off_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
+                    auto next_off_id = [&missing_ids, n_expert] (int id) {
+                        while (id < n_expert && (missing_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
                         return id;
                     };
 
-                    int first_id = next_on_id(0);
-                    while (first_id < n_expert) {
-                        int last_id = next_off_id(first_id+1);
-                        copy_experts(first_id, last_id-1);
-                        first_id = next_on_id(last_id);
+                    const bool use_span_copy =
+                            ggml_backend_sched_copy_expert_span_enabled() ||
+                            sched->enable_hot_expert_profile;
+
+                    if (use_span_copy) {
+                        int first_selected = next_on_id(0);
+                        if (first_selected < n_expert) {
+                            int last_selected = first_selected;
+                            for (int probe = first_selected + 1; probe < n_expert; ++probe) {
+                                if ((missing_ids[probe >> 5] & (1u << (probe & 31))) != 0) {
+                                    last_selected = probe;
+                                }
+                            }
+                            copy_experts(first_selected, last_selected);
+                        }
+                    } else {
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            int last_id = next_off_id(first_id+1);
+                            copy_experts(first_id, last_id-1);
+                            first_id = next_on_id(last_id);
+                        }
+                    }
+
+                    if (sched->debug_expert_cache && n_missing != n_selected) {
+                        fprintf(stderr, "%s: cached experts for %s on %s: selected=%d missing=%d\n",
+                                __func__, input->name, ggml_backend_name(split_backend), n_selected, n_missing);
+                    }
+                    if (sched->debug_sync_host_expert_staging) {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    if (sched->debug_expert_cache && interesting_debug) {
+                        fprintf(stderr,
+                                "%s: expert summary phase=%s tensor=%s layer=%d ids_shape=[%lld,%lld] selected=%d missing=%d hot_preloaded=%d hot_bytes=%zu cold_bytes=%zu backend=%s\n",
+                                __func__,
+                                is_decode_like ? "decode" : "prompt",
+                                input->name,
+                                ggml_parse_tensor_layer_id(input),
+                                (long long) ids_rows,
+                                (long long) ids_cols,
+                                n_selected,
+                                n_missing,
+                                hot_preloaded,
+                                hot_preload_bytes,
+                                cold_copy_bytes,
+                                ggml_backend_name(split_backend));
                     }
 
                 } else {
@@ -2410,11 +2857,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
     GGML_ASSERT(ggml_backend_is_cpu(backends[n_backends - 1])); // last backend must be CPU
 
-    struct ggml_backend_sched * sched = (ggml_backend_sched *)calloc(1, sizeof(struct ggml_backend_sched));
+    struct ggml_backend_sched * sched = new ggml_backend_sched();
 
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
+    sched->debug_expert_cache = getenv("GGML_EXPERT_CACHE_LOG") != NULL;
+    sched->debug_sync_host_expert_staging = getenv("GGML_EXPERT_COPY_SYNC") != NULL;
+    const char * expert_cache_env = getenv("GGML_EXPERT_CACHE");
+    if (expert_cache_env != NULL && (strcmp(expert_cache_env, "0") == 0 || strcasecmp(expert_cache_env, "false") == 0)) {
+        sched->enable_expert_cache = false;
+    }
+    ggml_backend_sched_load_hot_profile(sched, getenv("GGML_EXPERT_HOT_PROFILE"));
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
@@ -2486,7 +2940,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
-    free(sched);
+    delete sched;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
@@ -2543,7 +2997,8 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                 if (split->n_inputs < 1) continue;
                 size_t this_size = 0;
                 for (int j = 0; j < split->n_inputs; ++j) {
-                    if (!ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                    if (!ggml_backend_buffer_is_host(split->inputs[j]->buffer) ||
+                        ggml_is_host_expert_weight_tensor_for_staging(sched, split->inputs[j])) {
                         this_size += tensor_size(split->inputs[j]);
                     }
                 }
@@ -2573,7 +3028,8 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                 auto split = sched->backend_splits[backend_id][i];
                 size_t this_size = 0;
                 for (int j = 0; j < split->n_inputs; ++j) {
-                    if (!ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                    if (!ggml_backend_buffer_is_host(split->inputs[j]->buffer) ||
+                        ggml_is_host_expert_weight_tensor_for_staging(sched, split->inputs[j])) {
                         this_size += tensor_size(split->inputs[j]);
                     }
                 }
@@ -2582,12 +3038,17 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
                     input_size = 0;
                 }
                 for (int j = 0; j < split->n_inputs; ++j) {
-                    if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) continue;
+                    if (ggml_backend_buffer_is_host(split->inputs[j]->buffer) &&
+                        !ggml_is_host_expert_weight_tensor_for_staging(sched, split->inputs[j])) {
+                        continue;
+                    }
                     auto input_cpy = tensor_copy(split->inputs[j], backend_id, sched->cur_copy);
                     for (int k = 0; k < split->graph.n_nodes; ++k) {
                         auto node = split->graph.nodes[k];
                         for (int l = 0; l < GGML_MAX_SRC; ++l) {
-                            if (node->src[l] && node->src[l]->data == input_cpy->data) node->src[l]->data = ptr;
+                            if (node->src[l] == input_cpy || (node->src[l] && node->src[l]->view_src == input_cpy)) {
+                                node->src[l]->data = ptr;
+                            }
                         }
                     }
                     input_cpy->data = ptr;

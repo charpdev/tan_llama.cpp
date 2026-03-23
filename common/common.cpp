@@ -1485,6 +1485,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.tensor_buft_overrides.push_back({strdup("\\.ffn_(up|down|gate|gate_up)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
         return true;
     }
+    if (arg == "--hot-expert-profile") {
+        CHECK_ARG
+        params.hot_expert_profile = argv[i];
+        params.tensor_buft_overrides.push_back({strdup("\\.ffn_(up|down|gate|gate_up)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
+        return true;
+    }
     if (arg == "--n-cpu-moe" || arg == "-ncmoe") {
         CHECK_ARG
         int32_t n_layers = std::stoi(argv[i]);
@@ -2471,6 +2477,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --run-time-repack",      "repack tensors if interleaved variant is available"});
     options.push_back({ "*",           "       --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "       --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
+    options.push_back({ "*",           "       --hot-expert-profile F",  "path to hot-expert profile JSON for selective expert GPU loading"});
     options.push_back({ "*",           "       --numa TYPE",            "attempt optimizations that help on some NUMA systems\n"
                                                                         "  - distribute: spread execution evenly over all nodes\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
@@ -3413,6 +3420,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
 
     if (!params.offload_policy.empty()) cparams.offload_policy = (void *)&params.offload_policy;
     if (!params.cuda_params.empty()) cparams.cuda_params = (void *)params.cuda_params.data();
+    if (!params.hot_expert_profile.empty()) cparams.hot_expert_profile = params.hot_expert_profile.c_str();
 
     return cparams;
 }

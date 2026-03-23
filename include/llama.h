@@ -476,6 +476,7 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+        const char *        hot_expert_profile; // path to hot-expert profile for selective GPU loading (nullptr = disabled)
     };
 
     // model quantization parameters
